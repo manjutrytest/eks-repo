@@ -1,0 +1,46 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: "eu-west-1"           # change if needed
+    ECR_REPO: "sample-ekspoc"          # repo name (will be created if missing)
+    CLUSTER_NAME: "sample-eks-dev"     # EKS cluster name - change to your cluster
+    K8S_NAMESPACE: "dev"
+    DEPLOYMENT_NAME: "sample-app"
+phases:
+  pre_build:
+    commands:
+      - echo "Pre-build: get ECR login"
+      - aws --version
+      - $(aws ecr get-login --no-include-email --region $AWS_REGION)
+      - REPO_URI=$(aws ecr describe-repositories --repository-names $ECR_REPO --region $AWS_REGION --query 'repositories[0].repositoryUri' --output text || true)
+      - |
+        if [ -z "$REPO_URI" ]; then
+          echo "Creating ECR repository $ECR_REPO"
+          REPO_URI=$(aws ecr create-repository --repository-name $ECR_REPO --region $AWS_REGION --query 'repository.repositoryUri' --output text)
+        fi
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
+      - IMAGE=$REPO_URI:$IMAGE_TAG
+      - echo "IMAGE set to $IMAGE"
+  build:
+    commands:
+      - echo "Building Docker image..."
+      - docker build -t $IMAGE .
+      - echo "Pushing Docker image..."
+      - docker push $IMAGE
+  post_build:
+    commands:
+      - echo "Update kubeconfig for cluster $CLUSTER_NAME"
+      - aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+      - kubectl get ns || kubectl create ns $K8S_NAMESPACE || true
+      - echo "Apply k8s manifests (first-time)"
+      - sed -e "s|<ECR_URI_PLACEHOLDER>|$REPO_URI|g" k8s/deployment.yaml > /tmp/deploy.yaml
+      - kubectl apply -f /tmp/deploy.yaml
+      - echo "Set deployment image"
+      - kubectl set image deployment/$DEPLOYMENT_NAME -n $K8S_NAMESPACE $DEPLOYMENT_NAME=$IMAGE --record
+      - kubectl rollout status deployment/$DEPLOYMENT_NAME -n $K8S_NAMESPACE --timeout=120s
+      - echo "Run smoke test (attempting to get LB hostname)"
+      - SVC_HOST=$(kubectl get svc sample-app-svc -n $K8S_NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      - if [ -z "$SVC_HOST" ]; then echo "No LB hostname found yet. Describe svc:"; kubectl describe svc sample-app-svc -n $K8S_NAMESPACE; else echo "Curl http://$SVC_HOST/health"; curl -f http://$SVC_HOST/health || (kubectl describe pods -n $K8S_NAMESPACE; kubectl logs -n $K8S_NAMESPACE -l app=sample-app; exit 1); fi
+artifacts:
+  files: none
